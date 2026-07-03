@@ -275,6 +275,8 @@ def _validate_chat_history(
     "create_react_agent has been moved to `langchain.agents`. Please update your import to `from langchain.agents import create_agent`.",
     category=LangGraphDeprecatedSinceV10,
 )
+
+
 def create_react_agent(
     model: str
     | LanguageModelLike
@@ -304,6 +306,7 @@ def create_react_agent(
     debug: bool = False,
     version: Literal["v1", "v2"] = "v2",
     name: str | None = None,
+    atr_guard: bool | dict[str, Any] | None = None,
     **deprecated_kwargs: Any,
 ) -> CompiledStateGraph:
     """Creates an agent graph that calls tools in a loop until a stopping condition is met.
@@ -514,6 +517,30 @@ def create_react_agent(
             print(chunk)
         ```
     """
+
+    # ==================================================================
+    # 🛡️ NATIVE OWASP ASI06 / LLM01 ATR GUARD INITIALIZATION LAYER
+    # ==================================================================
+    if atr_guard:
+        from langgraph.prebuilt.atr_guard import ATRGuard
+        
+        # Pull custom configuration rules if passed as an options dict
+        custom_rules = atr_guard.get("custom_rules") if isinstance(atr_guard, dict) else None
+        guard_runnable = ATRGuard(custom_rules=custom_rules)
+        
+        if pre_model_hook is not None:
+            # Sequentially pipe the safety guard directly ahead of the existing user hook
+            from langchain_core.runnables import RunnableSequence, ensure_runnable
+            
+            pre_model_hook = RunnableSequence(
+                first=ensure_runnable(guard_runnable),
+                last=ensure_runnable(pre_model_hook)
+            )
+        else:
+            # Seamlessly elevate the security layer to serve as the baseline pre_model_hook
+            pre_model_hook = guard_runnable
+    # ==================================================================
+    
     if (
         config_schema := deprecated_kwargs.pop("config_schema", MISSING)
     ) is not MISSING:
