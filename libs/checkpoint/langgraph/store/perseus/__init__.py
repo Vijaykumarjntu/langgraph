@@ -1,9 +1,9 @@
 from __future__ import annotations
-
 import json
 import base64
 import hmac
 import hashlib
+import re
 import logging
 import shutil
 import subprocess
@@ -27,13 +27,20 @@ class PerseusCheckpointer(BaseCheckpointSaver):
     def __init__(
         self, 
         serde: Optional[SerializerProtocol] = None,
-        binary_path: str = "perseus",secret_key: str = "secure_fallback_key_change_me"
+        binary_path: str = "perseus",secret_key: str = "secure_fallback_key_change_me",
+        max_payload_bytes: int = 5 * 1024 * 1024
     ) -> None:
         super().__init__(serde=serde)
         self._given_binary_path = binary_path
         self._resolved_binary_path: Optional[str] = None
         self._process: Optional[subprocess.Popen] = None
         self.secret_key = secret_key.encode("utf-8")
+        self.max_payload_bytes = max_payload_bytes  # 5MB Threshold Bound
+        # Regex to intercept common adversarial injection payloads or hidden instructions
+        self.poison_pattern = re.compile(
+            r"(ignore previous instructions|system prompt override|assistant state:|\[system\])", 
+            re.IGNORECASE
+        )
 
     def _generate_signature(self, payload_str: str) -> str:
         """Generates an HMAC-SHA256 signature for a given text string."""
@@ -46,6 +53,26 @@ class PerseusCheckpointer(BaseCheckpointSaver):
         expected = self._generate_signature(payload_str)
         return hmac.compare_digest(expected, signature)
 
+    def _validate_structural_integrity(self, checkpoint: Any) -> None:
+        """Enforces OWASP ASI06 state structural validation rules."""
+        if not isinstance(checkpoint, dict):
+            raise ValueError("[OWASP SECURITY VIOLATION] Malformed checkpoint structure: Must be a dictionary.")
+        
+        # Verify required LangGraph base primitives
+        required_keys = {"v", "ts", "id", "channel_values"}
+        missing_keys = required_keys - checkpoint.keys()
+        if missing_keys:
+            raise ValueError(f"[OWASP SECURITY VIOLATION] Poisoned schema: Missing core keys {missing_keys}")
+
+        # Deep content sanitization on agent state values
+        channel_values = checkpoint.get("channel_values", {})
+        if not isinstance(channel_values, dict):
+            raise ValueError("[OWASP SECURITY VIOLATION] Poisoned channel state structure.")
+
+        for key, value in channel_values.items():
+            # Check for prompt injection strings hiding in memory variables
+            if isinstance(value, str) and self.poison_pattern.search(value):
+                raise ValueError(f"[OWASP SECURITY VIOLATION] Prompt injection vector detected in memory channel: '{key}'")
 
     def _resolve_binary(self) -> str:
         if self._resolved_binary_path:
@@ -94,10 +121,14 @@ class PerseusCheckpointer(BaseCheckpointSaver):
         if not res or "checkpoint" not in res:
             return None
 
-        # --- VALIDATION GUARD: ANTI-POISONING ---
         chk_raw = res["checkpoint"]
         meta_raw = res.get("metadata", "")
         
+        # 1. Size Threshold Validation (DoS Prevention)
+        if len(chk_raw) > self.max_payload_bytes or len(meta_raw) > self.max_payload_bytes:
+            raise ValueError("[OWASP SECURITY VIOLATION] Payload limit exceeded. Dropping request to prevent DoS.")
+
+        # --- VALIDATION GUARD: ANTI-POISONING ---
         if not self._verify_payload(chk_raw, res.get("checkpoint_sig")) or \
            not self._verify_payload(meta_raw, res.get("metadata_sig")):
             raise ValueError("[SECURITY ALARM] Checkpoint or Metadata signature verification failed! Possible poisoning attack detected.")
@@ -112,6 +143,9 @@ class PerseusCheckpointer(BaseCheckpointSaver):
         metadata = self.serde.loads_typed((res.get("metadata_type", "msgpack"), metadata_bytes))
         # checkpoint = self.serde.loads(checkpoint_bytes)
 
+        # 3. Structural and Semantic Memory Validation
+        self._validate_structural_integrity(checkpoint)
+        
         parent_config = {"configurable": {"thread_id": thread_id, "checkpoint_id": res.get("parent_id")}} if res.get("parent_id") else None
 
         return CheckpointTuple(
