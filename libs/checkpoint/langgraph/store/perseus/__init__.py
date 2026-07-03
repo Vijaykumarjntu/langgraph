@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import base64
-# ... other existing imports (typing, langgraph, etc.)
+import hmac
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -26,12 +27,25 @@ class PerseusCheckpointer(BaseCheckpointSaver):
     def __init__(
         self, 
         serde: Optional[SerializerProtocol] = None,
-        binary_path: str = "perseus"
+        binary_path: str = "perseus",secret_key: str = "secure_fallback_key_change_me"
     ) -> None:
         super().__init__(serde=serde)
         self._given_binary_path = binary_path
         self._resolved_binary_path: Optional[str] = None
         self._process: Optional[subprocess.Popen] = None
+        self.secret_key = secret_key.encode("utf-8")
+
+    def _generate_signature(self, payload_str: str) -> str:
+        """Generates an HMAC-SHA256 signature for a given text string."""
+        return hmac.new(self.secret_key, payload_str.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _verify_payload(self, payload_str: str, signature: Optional[str]) -> bool:
+        """Safely verifies the signature to mitigate timing attacks."""
+        if not signature:
+            return False
+        expected = self._generate_signature(payload_str)
+        return hmac.compare_digest(expected, signature)
+
 
     def _resolve_binary(self) -> str:
         if self._resolved_binary_path:
@@ -80,16 +94,14 @@ class PerseusCheckpointer(BaseCheckpointSaver):
         if not res or "checkpoint" not in res:
             return None
 
-        # Deserialize payloads safely back into LangGraph objects
-        # checkpoint = self.serde.loads(res["checkpoint"])
-        # metadata = self.serde.loads(res.get("metadata", "{}"))
-        # checkpoint = self.serde.loads(res["checkpoint"].encode("utf-8") if isinstance(res["checkpoint"], str) else res["checkpoint"])
-        # metadata = self.serde.loads(res.get("metadata", "{}").encode("utf-8") if isinstance(res.get("metadata"), str) else res.get("metadata", b"{}"))
-        # parent_config = {"configurable": {"thread_id": thread_id, "checkpoint_id": res.get("parent_id")}} if res.get("parent_id") else None
-
-        # Convert the textual JSON-RPC strings back to bytes for the serializer
-        checkpoint_bytes = res["checkpoint"].encode("utf-8") if isinstance(res["checkpoint"], str) else res["checkpoint"]
-        metadata_bytes = res.get("metadata", "{}").encode("utf-8") if isinstance(res.get("metadata"), str) else res.get("metadata", b"{}")
+        # --- VALIDATION GUARD: ANTI-POISONING ---
+        chk_raw = res["checkpoint"]
+        meta_raw = res.get("metadata", "")
+        
+        if not self._verify_payload(chk_raw, res.get("checkpoint_sig")) or \
+           not self._verify_payload(meta_raw, res.get("metadata_sig")):
+            raise ValueError("[SECURITY ALARM] Checkpoint or Metadata signature verification failed! Possible poisoning attack detected.")
+        # ----------------------------------------
 
         # Decode base64 strings back to the original binary bytes
         checkpoint_bytes = base64.b64decode(res["checkpoint"]) if isinstance(res["checkpoint"], str) else res["checkpoint"]
@@ -99,10 +111,7 @@ class PerseusCheckpointer(BaseCheckpointSaver):
         checkpoint = self.serde.loads_typed((res.get("checkpoint_type", "msgpack"), checkpoint_bytes))
         metadata = self.serde.loads_typed((res.get("metadata_type", "msgpack"), metadata_bytes))
         # checkpoint = self.serde.loads(checkpoint_bytes)
-        # metadata = self.serde.loads(metadata_bytes)
-        # loads_typed expects (type_string, bytes). Pass ("json", bytes) as fallback
-        # checkpoint = self.serde.loads_typed(("json", checkpoint_bytes))
-        # metadata = self.serde.loads_typed(("json", metadata_bytes))
+
         parent_config = {"configurable": {"thread_id": thread_id, "checkpoint_id": res.get("parent_id")}} if res.get("parent_id") else None
 
         return CheckpointTuple(
@@ -130,17 +139,21 @@ class PerseusCheckpointer(BaseCheckpointSaver):
         for entry in res.get("checkpoints", []):
             # chk_bytes = entry["checkpoint"].encode("utf-8") if isinstance(entry["checkpoint"], str) else entry["checkpoint"]
             # meta_bytes = entry.get("metadata", "{}").encode("utf-8") if isinstance(entry.get("metadata"), str) else entry.get("metadata", b"{}")
+            chk_raw = entry["checkpoint"]
+            meta_raw = entry.get("metadata", "")
+            print("now we are inside the list function and printing the checkpoint and metadata raw values:")
+            print(f"Checkpoint raw: {chk_raw}")
+            print(f"Metadata raw: {meta_raw}")
+            # --- VALIDATION GUARD: ANTI-POISONING ---
+            if not self._verify_payload(chk_raw, entry.get("checkpoint_sig")) or \
+               not self._verify_payload(meta_raw, entry.get("metadata_sig")):
+                raise ValueError("[SECURITY ALARM] Historical Checkpoint corruption or signature failure encountered.")
+            # ----------------------------------------
 
             chk_bytes = base64.b64decode(entry["checkpoint"]) if isinstance(entry["checkpoint"], str) else entry["checkpoint"]
             meta_bytes = base64.b64decode(entry.get("metadata", "")) if isinstance(entry.get("metadata"), str) else entry.get("metadata", b"")
             yield CheckpointTuple(
                 config={"configurable": {"thread_id": entry["thread_id"], "checkpoint_id": entry["checkpoint_id"]}},
-                # checkpoint=self.serde.loads(entry["checkpoint"]),
-                # metadata=self.serde.loads(entry.get("metadata", "{}")),
-                # checkpoint=self.serde.loads(chk_bytes),
-                # metadata=self.serde.loads(meta_bytes),  
-                # checkpoint=self.serde.loads_typed(("json", chk_bytes)),
-                # metadata=self.serde.loads_typed(("json", meta_bytes)),
                 checkpoint=self.serde.loads_typed((entry.get("checkpoint_type", "msgpack"), chk_bytes)),
                 metadata=self.serde.loads_typed((entry.get("metadata_type", "msgpack"), meta_bytes)),
                 parent_config={"configurable": {"thread_id": entry["thread_id"], "checkpoint_id": entry.get("parent_id")}} if entry.get("parent_id") else None,
@@ -157,36 +170,22 @@ class PerseusCheckpointer(BaseCheckpointSaver):
         thread_id = config["configurable"]["thread_id"]
         checkpoint_id = config["configurable"]["checkpoint_id"]
 
-        # payload = {
-        #     "thread_id": thread_id,
-        #     "checkpoint_id": checkpoint_id,
-        #     # "checkpoint": self.serde.dumps(checkpoint),
-        #     # "metadata": self.serde.dumps(metadata),
-        #     "checkpoint": self.serde.dumps(checkpoint).decode("utf-8"),
-        #     "metadata": self.serde.dumps(metadata).decode("utf-8"),
-        #     "parent_id": config["configurable"].get("parent_id"),
-        # }
-
-        # dumps_typed returns a tuple: (type_string, bytes)
-        # We grab the bytes payload at index [1] and decode it
-        # checkpoint_payload = self.serde.dumps_typed(checkpoint)[1].decode("utf-8")
-        # metadata_payload = self.serde.dumps_typed(metadata)[1].decode("utf-8")
-        # Decode the serialized binary data to plain strings for standard I/O framing
-
         # dumps_typed returns a tuple: (type_string, binary_bytes)
         chk_type, chk_bytes = self.serde.dumps_typed(checkpoint)
         meta_type, meta_bytes = self.serde.dumps_typed(metadata)
+
+        chk_b64 = base64.b64encode(chk_bytes).decode("ascii")
+        meta_b64 = base64.b64encode(meta_bytes).decode("ascii")
+
         payload = {
             "thread_id": thread_id,
             "checkpoint_id": checkpoint_id,
-            # "checkpoint": self.serde.dumps(checkpoint).decode("utf-8"),
-            # "metadata": self.serde.dumps(metadata).decode("utf-8"),
-            "checkpoint": base64.b64encode(chk_bytes).decode("ascii"),
+            "checkpoint": chk_b64,
+            "checkpoint_sig": self._generate_signature(chk_b64),
             "checkpoint_type": chk_type,
-            "metadata": base64.b64encode(meta_bytes).decode("ascii"),
+            "metadata": meta_b64,
+            "metadata_sig": self._generate_signature(meta_b64),
             "metadata_type": meta_type,
-            # "checkpoint": checkpoint_payload,
-            # "metadata": metadata_payload,
             "parent_id": config["configurable"].get("parent_id"),
         }
         self._call_perseus("context/save", payload)

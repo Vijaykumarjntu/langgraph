@@ -78,6 +78,9 @@ def test_perseus_checkpointer_get_tuple(mock_perseus_engine: MockPerseusPipe) ->
     chk_type, chk_bytes = checkpointer.serde.dumps_typed(fake_checkpoint)
     meta_type, meta_bytes = checkpointer.serde.dumps_typed(fake_metadata)
 
+    chk_b64 = base64.b64encode(chk_bytes).decode("ascii")
+    meta_b64 = base64.b64encode(meta_bytes).decode("ascii")
+
     mock_perseus_engine.mock_responses.append({
         "jsonrpc": "2.0",
         "id": 1,
@@ -85,14 +88,11 @@ def test_perseus_checkpointer_get_tuple(mock_perseus_engine: MockPerseusPipe) ->
             "thread_id": "thread-42",
             "checkpoint_id": "ch-101",
             "parent_id": "ch-100",
-            # "checkpoint": checkpointer.serde.dumps(fake_checkpoint).decode("utf-8"),
-            # "metadata": checkpointer.serde.dumps(fake_metadata).decode("utf-8"),
-            # Grab the raw bytes component [1] and decode
-            # "checkpoint": checkpointer.serde.dumps_typed(fake_checkpoint)[1].decode("utf-8"),
-            # "metadata": checkpointer.serde.dumps_typed(fake_metadata)[1].decode("utf-8"),
             "checkpoint": base64.b64encode(chk_bytes).decode("ascii"),
+            "checkpoint_sig": checkpointer._generate_signature(chk_b64),
             "checkpoint_type": chk_type,
             "metadata": base64.b64encode(meta_bytes).decode("ascii"),
+            "metadata_sig": checkpointer._generate_signature(meta_b64),
             "metadata_type": meta_type
         }
     })
@@ -115,6 +115,9 @@ def test_perseus_checkpointer_list(mock_perseus_engine: MockPerseusPipe) -> None
     chk_type, chk_bytes = checkpointer.serde.dumps_typed(fake_checkpoint)
     meta_type, meta_bytes = checkpointer.serde.dumps_typed({})
 
+    chk_b64 = base64.b64encode(chk_bytes).decode("ascii")
+    meta_b64 = base64.b64encode(meta_bytes).decode("ascii")
+
     mock_perseus_engine.mock_responses.append({
         "jsonrpc": "2.0",
         "id": 1,
@@ -124,14 +127,11 @@ def test_perseus_checkpointer_list(mock_perseus_engine: MockPerseusPipe) -> None
                     "thread_id": "thread-42",
                     "checkpoint_id": "ch-101",
                     "parent_id": None,
-                    # "checkpoint": checkpointer.serde.dumps(fake_checkpoint).decode("utf-8"),
-                    # "metadata": checkpointer.serde.dumps({}).decode("utf-8"),
-                    # Grab the raw bytes component [1] and decode
-                    # "checkpoint": checkpointer.serde.dumps_typed(fake_checkpoint)[1].decode("utf-8"),
-                    # "metadata": checkpointer.serde.dumps_typed({})[1].decode("utf-8")
-                    "checkpoint": base64.b64encode(chk_bytes).decode("ascii"),
+                    "checkpoint": chk_b64,
+                    "checkpoint_sig": checkpointer._generate_signature(chk_b64), # ADDED
                     "checkpoint_type": chk_type,
-                    "metadata": base64.b64encode(meta_bytes).decode("ascii"),
+                    "metadata": meta_b64,
+                    "metadata_sig": checkpointer._generate_signature(meta_b64), # ADDED
                     "metadata_type": meta_type
                 }
             ]
@@ -143,3 +143,35 @@ def test_perseus_checkpointer_list(mock_perseus_engine: MockPerseusPipe) -> None
 
     assert len(history) == 1
     assert history[0].config["configurable"]["checkpoint_id"] == "ch-101"
+
+def test_perseus_checkpointer_poisoning_defense(mock_perseus_engine: MockPerseusPipe) -> None:
+    """Ensures that modified payloads trigger a ValueError before deserialization."""
+    checkpointer = PerseusCheckpointer()
+    
+    fake_checkpoint = {"v": 1, "ts": "2026-07-02T12:00:00Z", "id": "ch-101", "channel_values": {}}
+    chk_type, chk_bytes = checkpointer.serde.dumps_typed(fake_checkpoint)
+    chk_b64 = base64.b64encode(chk_bytes).decode("ascii")
+    
+    # Attack payload!
+    poisoned_chk_b64 = base64.b64encode(b'{"malicious_injected_op": true}').decode("ascii")
+
+    mock_perseus_engine.mock_responses.append({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "thread_id": "thread-42",
+            "checkpoint_id": "ch-101",
+            "parent_id": None,
+            "checkpoint": poisoned_chk_b64,  # Swapped data block!
+            "checkpoint_sig": checkpointer._generate_signature(chk_b64),  # Signature doesn't match new payload
+            "checkpoint_type": chk_type,
+            "metadata": "",
+            "metadata_sig": checkpointer._generate_signature(""),
+            "metadata_type": "json"
+        }
+    })
+
+    config = {"configurable": {"thread_id": "thread-42", "checkpoint_id": "ch-101"}}
+    
+    with pytest.raises(ValueError, match="Possible poisoning attack detected"):
+        checkpointer.get_tuple(config)
