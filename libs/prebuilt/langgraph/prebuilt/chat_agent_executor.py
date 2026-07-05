@@ -46,6 +46,11 @@ from typing_extensions import NotRequired, TypedDict, deprecated
 
 from langgraph.prebuilt.tool_node import ToolCallWithContext, ToolNode
 
+
+from typing import Dict, Any, Optional, List, Union
+from pydantic import BaseModel, Field
+from langchain_core.messages import BaseMessage
+
 StructuredResponse = dict | BaseModel
 StructuredResponseSchema = dict | type[BaseModel]
 
@@ -541,6 +546,9 @@ def create_react_agent(
             pre_model_hook = guard_runnable
     # ==================================================================
     
+
+    
+
     if (
         config_schema := deprecated_kwargs.pop("config_schema", MISSING)
     ) is not MISSING:
@@ -1029,6 +1037,141 @@ def create_react_agent(
     )
 
 
+import requests
+from typing import Optional
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool
+
+# ==================================================================
+# 🧬 NATIVE BGPT SCIENTIFIC EVIDENCE DATA RETRIEVAL LAYER
+# ==================================================================
+
+class BGPTSearchSchema(BaseModel):
+    query: str = Field(
+        description="Natural language scientific or biomedical research query (e.g., 'RCTs on GLP-1 agonists weight maintenance' or 'CRISPR off-target effect mutations')."
+    )
+    num_results: Optional[int] = Field(
+        default=5,
+        description="Number of papers to retrieve from the extracted database (1-20)."
+    )
+    days_back: Optional[int] = Field(
+        default=None,
+        description="Filter to restrict papers published within the last N days."
+    )
+
+
+@tool(args_schema=BGPTSearchSchema)
+def search_bgpt_evidence(query: str, num_results: int = 5, days_back: Optional[int] = None) -> str:
+    """Queries full-text scientific papers from the hosted BGPT database.
+    Unlike standard abstract engines, this extracts deep structural metadata:
+    methods, exact sample sizes, results, study limitations, quality scores,
+    and criteria for falsifiability.
+    """
+    payload = {
+        "query": query,
+        "num_results": num_results
+    }
+    if days_back is not None:
+        payload["days_back"] = days_back
+
+    try:
+        # Connect to the remote backend endpoint running the BGPT search engine
+        response = requests.post(
+            "https://bgpt.pro/api/mcp-search", 
+            json=payload, 
+            timeout=25
+        )
+        response.raise_for_status()
+        papers = response.json()
+        
+        if not papers:
+            return f"No verified experimental evidence found in the database for: '{query}'."
+
+        formatted_evidence = []
+        for index, paper in enumerate(papers, 1):
+            title = paper.get("title", "Unknown Publication")
+            year = paper.get("year", "N/A")
+            authors = paper.get("authors", "N/A")
+            
+            # Extracting unique BGPT deep-text experimental fields
+            methods = paper.get("methods", "Not specified")
+            results = paper.get("results", "Not specified")
+            limitations = paper.get("limitations", "None logged")
+            falsify = paper.get("how_to_falsify", "N/A")
+            quality = paper.get("quality_score", "N/A")
+
+            formatted_evidence.append(
+                f"[{index}] Title: {title} ({year}) - {authors}\n"
+                f"    • Quality Score: {quality}\n"
+                f"    • Methods/Sample: {methods}\n"
+                f"    • Key Findings: {results}\n"
+                f"    • Study Limitations: {limitations}\n"
+                f"    • Falsifiability Prompt: {falsify}\n"
+            )
+            
+        return "\n".join(formatted_evidence)
+
+    except Exception as e:
+        return f"BGPT MCP Integration Gateway Connection Failure: {str(e)}"
+
+
+
+
+class SubGraphUpdateCommand(BaseModel):
+    """Payload template that mandates state mutations on a specific nested sub-graph node."""
+    target_subgraph: str = Field(
+        ..., 
+        description="The dot-notation or name of the target sub-graph (e.g., 'research_graph' or 'billing.checkout')."
+    )
+    state_update: Dict[str, Any] = Field(
+        ..., 
+        description="Key-value state dictionary updates to apply directly onto the sub-graph scope."
+    )
+
+
+def handle_subgraph_command_invoke(
+    compiled_graph: Any, 
+    input_payload: Dict[str, Any], 
+    config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Intercepts standard invoke calls. If a SubGraphUpdateCommand is present, 
+    it patches the targeted sub-graph's internal state before running the main graph cycle.
+    """
+    command_data = input_payload.get("command")
+    
+    # Check if we received a subgraph mutation packet
+    if command_data and isinstance(command_data, dict) and "target_subgraph" in command_data:
+        cmd = SubGraphUpdateCommand.model_validate(command_data)
+        
+        # Build out the operational context path needed to find the sub-graph checkpoint channel
+        target_ns = cmd.target_subgraph
+        current_config = config or {}
+        
+        # Combine base configuration context with sub-graph namespace addresses
+        subgraph_config = {
+            **current_config,
+            "configurable": {
+                **current_config.get("configurable", {}),
+                "checkpoint_ns": target_ns
+            }
+        }
+        
+        # Direct write into the sub-graph's state channel using LangGraph's underlying state machine
+        compiled_graph.update_state(
+            subgraph_config, 
+            cmd.state_update, 
+            as_node=target_ns
+        )
+        
+        # Clean the input payload so the graph doesn't process the control command as standard message traffic
+        clean_payload = {k: v for k, v in input_payload.items() if k != "command"}
+    else:
+        clean_payload = input_payload
+
+    # Resume the core execution cycle
+    return compiled_graph.invoke(clean_payload, config=config)
+
+
 # Keep for backwards compatibility
 create_tool_calling_executor = create_react_agent
 
@@ -1039,4 +1182,5 @@ __all__ = [
     "AgentStatePydantic",
     "AgentStateWithStructuredResponse",
     "AgentStateWithStructuredResponsePydantic",
+    "search_bgpt_evidence"
 ]
